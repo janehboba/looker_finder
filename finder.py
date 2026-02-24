@@ -1,466 +1,347 @@
-"""
-Complete Website Crawler - All-in-One Script
-Crawls entire websites and saves data locally for manual upload to Databricks
-
-Usage:
-    1. Edit the CONFIGURATION section below
-    2. Run: python website_crawler.py
-    3. Find output in ./crawled_data/ directory
-    4. Upload JSON file to Databricks manually
-"""
-
 import requests
 from bs4 import BeautifulSoup
-from urllib.parse import urljoin, urlparse
-from urllib.robotparser import RobotFileParser
 import json
 import time
 import os
 from datetime import datetime
-from collections import deque
-import re
-from typing import Set, Dict, List, Tuple
-import logging
-from pathlib import Path
 
-
-# ============================================================================
-# CONFIGURATION - EDIT THESE SETTINGS
-# ============================================================================
-
-CONFIG = {
-    # Target website
-    'base_url': 'https://example.com',  # CHANGE THIS!
-    
-    # Crawling limits
-    'max_pages': 100,                    # Maximum pages to crawl
-    'max_depth': 0,                      # 0 = unlimited, 1 = homepage only, 2 = homepage + 1 level
-    'delay_between_requests': 2.0,       # Seconds between requests (be respectful!)
-    
-    # Content settings
-    'max_content_length': 50000,         # Max characters per page
-    'min_content_length': 100,           # Minimum content to save a page
-    'request_timeout': 15,               # Request timeout in seconds
-    
-    # Behavior
-    'respect_robots_txt': True,          # Follow robots.txt rules
-    'follow_external_links': False,      # Crawl external domains
-    'remove_query_params': False,        # Remove ?query=params from URLs
-    
-    # Output
-    'output_directory': './crawled_data',  # Where to save files
-    'save_logs_to_file': True,            # Save logs to crawler.log
-    'log_level': 'INFO',                  # DEBUG, INFO, WARNING, ERROR
-    
-    # URL filtering
-    'excluded_extensions': [
-        '.pdf', '.doc', '.docx', '.xls', '.xlsx', '.ppt', '.pptx',
-        '.zip', '.rar', '.tar', '.gz', '.jpg', '.jpeg', '.png', 
-        '.gif', '.bmp', '.svg', '.webp', '.mp4', '.avi', '.mov',
-        '.mp3', '.wav', '.css', '.js', '.xml', '.json', '.ico'
-    ],
-    'excluded_patterns': [
-        '/login', '/logout', '/signin', '/signup', '/register',
-        '/cart', '/checkout', '/admin', '/wp-admin',
-        '/feed', '/rss', '/api/', '/search?'
-    ],
-    'included_patterns': [],  # Only crawl URLs with these patterns (empty = all)
-    
-    # Content extraction
-    'content_selectors': [
-        'main', 'article', '[role="main"]', '.main-content',
-        '.content', '#content', '.post-content', '.article-content'
-    ],
-    'remove_elements': [
-        'script', 'style', 'nav', 'footer', 'header', 'aside',
-        '.advertisement', '.sidebar', '.comments', '#comments'
-    ],
+HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                  "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
 }
 
+BASE_URL = "https://api.usaspending.gov/api/v2"
+API_HEADERS = {"Content-Type": "application/json"}
 
-# ============================================================================
-# CRAWLER IMPLEMENTATION
-# ============================================================================
-
-class WebsiteCrawler:
-    """Complete website crawler with all features"""
-    
-    def __init__(self, config: Dict):
-        self.config = config
-        self.base_url = config['base_url']
-        self.domain = urlparse(self.base_url).netloc
-        self.max_pages = config['max_pages']
-        self.delay = config['delay_between_requests']
-        self.max_depth = config['max_depth']
-        
-        self.visited_urls: Set[str] = set()
-        self.to_visit: deque = deque([(self.base_url, 0)])
-        self.scraped_data: List[Dict] = []
-        
-        self._setup_logging()
-        self.session = requests.Session()
-        self.session.headers.update({
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
-        })
-        
-        self.robot_parser = None
-        if config['respect_robots_txt']:
-            self._setup_robots_txt()
-    
-    def _setup_logging(self):
-        """Configure logging"""
-        log_level = getattr(logging, self.config['log_level'])
-        handlers = [logging.StreamHandler()]
-        
-        if self.config['save_logs_to_file']:
-            handlers.append(logging.FileHandler('crawler.log'))
-        
-        logging.basicConfig(
-            level=log_level,
-            format='%(asctime)s - %(levelname)s - %(message)s',
-            handlers=handlers,
-            force=True
-        )
-        self.logger = logging.getLogger(__name__)
-    
-    def _setup_robots_txt(self):
-        """Parse robots.txt"""
-        try:
-            robots_url = urljoin(self.base_url, '/robots.txt')
-            self.robot_parser = RobotFileParser()
-            self.robot_parser.set_url(robots_url)
-            self.robot_parser.read()
-            self.logger.info("✓ Parsed robots.txt")
-        except:
-            self.robot_parser = None
-    
-    def can_fetch(self, url: str) -> bool:
-        """Check robots.txt"""
-        if not self.robot_parser:
-            return True
-        try:
-            return self.robot_parser.can_fetch('*', url)
-        except:
-            return True
-    
-    def is_valid_url(self, url: str) -> bool:
-        """Check if URL should be crawled"""
-        try:
-            parsed = urlparse(url)
-            
-            # Check domain
-            if not self.config['follow_external_links']:
-                if parsed.netloc and parsed.netloc != self.domain:
-                    return False
-            
-            # Check excluded extensions
-            if any(url.lower().endswith(ext) for ext in self.config['excluded_extensions']):
-                return False
-            
-            # Check excluded patterns
-            if any(pattern in url.lower() for pattern in self.config['excluded_patterns']):
-                return False
-            
-            # Check included patterns
-            if self.config['included_patterns']:
-                if not any(pattern in url.lower() for pattern in self.config['included_patterns']):
-                    return False
-            
-            # Check robots.txt
-            if not self.can_fetch(url):
-                return False
-            
-            return True
-        except:
-            return False
-    
-    def normalize_url(self, url: str) -> str:
-        """Normalize URL"""
-        url = url.split('#')[0]
-        if self.config['remove_query_params']:
-            url = url.split('?')[0]
-        return url
-    
-    def extract_links(self, soup: BeautifulSoup, current_url: str, current_depth: int) -> List[Tuple[str, int]]:
-        """Extract valid links"""
-        links = []
-        
-        if self.max_depth > 0 and current_depth >= self.max_depth:
-            return links
-        
-        for anchor in soup.find_all('a', href=True):
-            href = anchor['href']
-            absolute_url = urljoin(current_url, href)
-            absolute_url = self.normalize_url(absolute_url)
-            
-            if self.is_valid_url(absolute_url) and absolute_url not in self.visited_urls:
-                links.append((absolute_url, current_depth + 1))
-        
-        return links
-    
-    def clean_text(self, text: str) -> str:
-        """Clean extracted text"""
-        return re.sub(r'\s+', ' ', text).strip()
-    
-    def extract_metadata(self, soup: BeautifulSoup) -> Dict:
-        """Extract page metadata"""
-        metadata = {}
-        
-        # Meta tags
-        for name in ['description', 'keywords', 'author']:
-            tag = soup.find('meta', attrs={'name': name})
-            if tag and 'content' in tag.attrs:
-                metadata[name] = tag['content']
-        
-        # Open Graph
-        for prop in ['og:title', 'og:description', 'og:image']:
-            tag = soup.find('meta', attrs={'property': prop})
-            if tag and 'content' in tag.attrs:
-                metadata[prop] = tag['content']
-        
-        return metadata
-    
-    def extract_content(self, soup: BeautifulSoup, url: str, depth: int) -> Dict:
-        """Extract all content from page"""
-        
-        # Title
-        title = soup.find('title')
-        title_text = self.clean_text(title.text) if title else ''
-        
-        # Metadata
-        metadata = self.extract_metadata(soup)
-        
-        # Main content
-        main_content = None
-        for selector in self.config['content_selectors']:
-            main_content = soup.select_one(selector)
-            if main_content:
-                break
-        
-        if not main_content:
-            main_content = soup.find('body')
-        
-        # Remove unwanted elements
-        if main_content:
-            for selector in self.config['remove_elements']:
-                for element in main_content.select(selector):
-                    element.decompose()
-            content_text = self.clean_text(main_content.get_text())
-        else:
-            content_text = ''
-        
-        # Limit length
-        max_length = self.config['max_content_length']
-        if len(content_text) > max_length:
-            content_text = content_text[:max_length] + '... [truncated]'
-        
-        # Headings
-        headings = []
-        for heading in soup.find_all(['h1', 'h2', 'h3', 'h4']):
-            headings.append({
-                'level': heading.name,
-                'text': self.clean_text(heading.get_text())
-            })
-        
-        # Links
-        links = []
-        for link in soup.find_all('a', href=True)[:20]:
-            links.append({
-                'text': self.clean_text(link.get_text()),
-                'href': urljoin(url, link['href'])
-            })
-        
-        # Images
-        images = []
-        for img in soup.find_all('img', alt=True)[:10]:
-            if img.get('src'):
-                images.append({
-                    'src': urljoin(url, img['src']),
-                    'alt': img['alt']
-                })
-        
-        return {
-            'url': url,
-            'depth': depth,
-            'title': title_text,
-            'metadata': metadata,
-            'content': content_text,
-            'headings': headings,
-            'links': links,
-            'images': images,
-            'content_length': len(content_text),
-            'word_count': len(content_text.split()),
-            'timestamp': datetime.now().isoformat()
-        }
-    
-    def crawl_page(self, url: str, depth: int) -> bool:
-        """Crawl a single page"""
-        try:
-            self.logger.info(f"Crawling (depth {depth}): {url}")
-            
-            timeout = self.config['request_timeout']
-            response = self.session.get(url, timeout=timeout)
-            response.raise_for_status()
-            
-            # Check content type
-            content_type = response.headers.get('content-type', '')
-            if 'text/html' not in content_type.lower():
-                self.logger.info(f"Skipping non-HTML: {url}")
-                return False
-            
-            soup = BeautifulSoup(response.content, 'html.parser')
-            page_data = self.extract_content(soup, url, depth)
-            
-            # Check minimum length
-            if page_data['content_length'] >= self.config['min_content_length']:
-                self.scraped_data.append(page_data)
-                self.logger.info(
-                    f"✓ {page_data['content_length']} chars, "
-                    f"{page_data['word_count']} words"
-                )
-            else:
-                self.logger.info(f"✗ Skipping (minimal content)")
-            
-            # Find new links
-            new_links = self.extract_links(soup, url, depth)
-            for link_url, link_depth in new_links:
-                if link_url not in self.visited_urls:
-                    if not any(link_url == u for u, _ in self.to_visit):
-                        self.to_visit.append((link_url, link_depth))
-            
-            return True
-            
-        except Exception as e:
-            self.logger.error(f"Error: {e}")
-            return False
-    
-    def crawl(self) -> List[Dict]:
-        """Crawl entire website"""
-        self.logger.info("="*60)
-        self.logger.info(f"Starting crawl: {self.base_url}")
-        self.logger.info(f"Max pages: {self.max_pages}")
-        self.logger.info(f"Max depth: {self.max_depth if self.max_depth > 0 else 'unlimited'}")
-        self.logger.info(f"Delay: {self.delay}s")
-        self.logger.info("="*60)
-        
-        start_time = time.time()
-        
-        while self.to_visit and len(self.visited_urls) < self.max_pages:
-            url, depth = self.to_visit.popleft()
-            
-            if url in self.visited_urls:
-                continue
-            
-            self.visited_urls.add(url)
-            self.crawl_page(url, depth)
-            time.sleep(self.delay)
-            
-            # Progress
-            if len(self.visited_urls) % 10 == 0:
-                elapsed = time.time() - start_time
-                rate = len(self.visited_urls) / elapsed if elapsed > 0 else 0
-                self.logger.info(
-                    f"Progress: {len(self.visited_urls)} pages, "
-                    f"{len(self.to_visit)} queued, "
-                    f"{rate:.2f} pages/sec"
-                )
-        
-        elapsed = time.time() - start_time
-        self.logger.info("="*60)
-        self.logger.info(f"✓ Crawl complete!")
-        self.logger.info(f"Total pages: {len(self.visited_urls)}")
-        self.logger.info(f"Pages saved: {len(self.scraped_data)}")
-        self.logger.info(f"Time: {elapsed:.1f}s")
-        self.logger.info("="*60)
-        
-        return self.scraped_data
+# ── Output directory ──────────────────────────────────────────────────────────
+OUTPUT_DIR = "/Volumes/your_catalog/your_schema/your_volume/subawards"
 
 
-def save_results(data: List[Dict], config: Dict):
-    """Save crawled data locally"""
-    output_dir = config['output_directory']
-    Path(output_dir).mkdir(parents=True, exist_ok=True)
-    
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    
-    # Save main data
-    data_file = f"scraped_data_{timestamp}.json"
-    data_path = os.path.join(output_dir, data_file)
-    
-    with open(data_path, 'w', encoding='utf-8') as f:
-        json.dump(data, f, indent=2, ensure_ascii=False)
-    
-    print(f"\n✓ Data saved: {data_path}")
-    
-    # Save summary
-    summary = {
-        'timestamp': timestamp,
-        'base_url': config['base_url'],
-        'total_pages': len(data),
-        'total_words': sum(p.get('word_count', 0) for p in data),
-        'total_characters': sum(p['content_length'] for p in data),
-        'urls': [p['url'] for p in data],
-        'depths': [p.get('depth', 0) for p in data],
-        'data_file': data_file,
-        'statistics': {
-            'avg_content_length': sum(p['content_length'] for p in data) / len(data) if data else 0,
-            'avg_word_count': sum(p.get('word_count', 0) for p in data) / len(data) if data else 0,
-            'max_depth': max(p.get('depth', 0) for p in data) if data else 0
-        }
-    }
-    
-    summary_file = f"summary_{timestamp}.json"
-    summary_path = os.path.join(output_dir, summary_file)
-    
-    with open(summary_path, 'w', encoding='utf-8') as f:
-        json.dump(summary, f, indent=2, ensure_ascii=False)
-    
-    print(f"✓ Summary saved: {summary_path}")
-    
-    return data_path, summary_path
+def resolve_company_url(company_name: str, delay: float = 1.0) -> dict:
+    """
+    Search Bing for a company name and return a {company_name: url} key pair.
+    Bing is used as it's more scrape-tolerant than Google.
+    Falls back to a DuckDuckGo redirect if Bing returns nothing.
+    """
+    if not company_name:
+        return {company_name: None}
 
+    # Clean up name for searching
+    query = f"{company_name} official website"
+    search_url = f"https://www.bing.com/search?q={requests.utils.quote(query)}&count=5"
 
-def main():
-    """Main execution"""
-    print("\n" + "="*60)
-    print("Website Crawler for Databricks")
-    print("="*60)
-    
-    # Validate config
-    if CONFIG['base_url'] == 'https://example.com':
-        print("\n⚠️  WARNING: You need to edit the CONFIG section!")
-        print("Change 'base_url' to your target website.\n")
-        return
-    
-    # Crawl
-    crawler = WebsiteCrawler(CONFIG)
-    
     try:
-        data = crawler.crawl()
-    except KeyboardInterrupt:
-        print("\n\n⚠️  Crawl interrupted by user")
-        data = crawler.scraped_data
+        response = requests.get(search_url, headers=HEADERS, timeout=15)
+        response.raise_for_status()
+        soup = BeautifulSoup(response.text, "lxml")
+
+        # Grab first organic result
+        for li in soup.select("li.b_algo"):
+            link_tag = li.select_one("h2 a")
+            if link_tag and link_tag.get("href"):
+                url = link_tag["href"]
+                # Skip PDF links and known non-company domains
+                if not any(skip in url for skip in ["linkedin.com", "bloomberg.com", ".pdf", "wikipedia"]):
+                    return {company_name: url}
+
+        # DuckDuckGo fallback
+        ddg_url = f"https://duckduckgo.com/html/?q={requests.utils.quote(query)}"
+        ddg_response = requests.get(ddg_url, headers=HEADERS, timeout=15)
+        ddg_soup = BeautifulSoup(ddg_response.text, "lxml")
+        first_result = ddg_soup.select_one("a.result__a")
+        if first_result and first_result.get("href"):
+            return {company_name: first_result["href"]}
+
     except Exception as e:
-        print(f"\n❌ Error: {e}")
-        return
-    
-    if not data:
-        print("\n❌ No data scraped. Check your configuration.")
-        return
-    
-    # Save results
-    data_path, summary_path = save_results(data, CONFIG)
-    
-    # Final summary
-    print("\n" + "="*60)
-    print("SUCCESS!")
-    print("="*60)
-    print(f"Pages crawled: {len(data)}")
-    print(f"Total words: {sum(p.get('word_count', 0) for p in data):,}")
-    print(f"Data file: {data_path}")
-    print(f"\nNext step: Upload {os.path.basename(data_path)} to Databricks")
-    print("="*60 + "\n")
+        print(f"    URL resolution failed for '{company_name}': {e}")
+
+    time.sleep(delay)
+    return {company_name: None}
 
 
-if __name__ == "__main__":
-    main()
+def resolve_all_company_urls(company_names: list, delay: float = 1.2) -> dict:
+    """
+    Resolve a list of company names to URLs.
+    Returns a dict: { company_name: url, ... }
+    De-duplicates so each company is only searched once.
+    """
+    unique_names = list(set([n for n in company_names if n]))
+    url_map = {}
+
+    print(f"\n  Resolving URLs for {len(unique_names)} unique companies...")
+
+    for name in unique_names:
+        print(f"    Searching: {name}")
+        result = resolve_company_url(name)
+        url_map.update(result)
+        time.sleep(delay)
+
+    return url_map
+
+
+# Step 3
+
+def get_award_id_from_piid(piid: str) -> tuple:
+    url = f"{BASE_URL}/search/spending_by_award/"
+    payload = {
+        "filters": {
+            "award_type_codes": ["A", "B", "C", "D"],
+            "keywords": [piid]
+        },
+        "fields": ["Award ID", "internal_id", "Recipient Name", "Award Amount", "Start Date", "End Date"],
+        "limit": 5,
+        "page": 1,
+        "sort": "Award Amount",
+        "order": "desc",
+        "subawards": False
+    }
+    response = requests.post(url, json=payload, headers=API_HEADERS, timeout=15)
+    response.raise_for_status()
+    results = response.json().get("results", [])
+
+    if not results:
+        raise ValueError(f"No award found for PIID: {piid}")
+
+    award = results[0]
+    print(f"  Award: {award.get('Award ID')} | Recipient: {award.get('Recipient Name')} | Amount: ${award.get('Award Amount'):,.2f}")
+    return award.get("internal_id"), award
+
+
+def fetch_all_subawards(internal_id: str, page_size: int = 50) -> list:
+    url = f"{BASE_URL}/awards/{internal_id}/subawards/"
+    all_subawards = []
+    page = 1
+
+    while True:
+        payload = {
+            "award_id": internal_id,
+            "limit": page_size,
+            "page": page,
+            "sort": "subaward_amount",
+            "order": "desc"
+        }
+        response = requests.post(url, json=payload, headers=API_HEADERS, timeout=15)
+        response.raise_for_status()
+        data = response.json()
+
+        results = data.get("results", [])
+        if not results:
+            break
+
+        all_subawards.extend(results)
+        print(f"  Page {page}: {len(results)} subawards (total: {len(all_subawards)})")
+
+        if not data.get("page_metadata", {}).get("hasNext", False):
+            break
+
+        page += 1
+        time.sleep(0.5)
+
+    return all_subawards
+
+# Step 4
+
+def normalize_subaward(subaward: dict, piid: str, parent_award: dict, url_map: dict) -> dict:
+    """
+    Normalize subaward and inject the resolved subawardee_url from the url_map.
+    """
+    recipient_name = subaward.get("recipient_name")
+
+    return {
+        # Identifiers
+        "piid": piid,
+        "subaward_number": subaward.get("subaward_number"),
+        "subaward_id": subaward.get("id"),
+        "parent_award_id": parent_award.get("Award ID"),
+        "parent_internal_id": parent_award.get("internal_id"),
+
+        # Recipient / Awardee Info
+        "recipient_name": recipient_name,
+        "recipient_unique_id": subaward.get("recipient_unique_id"),
+        "recipient_uei": subaward.get("recipient_uei"),
+        "recipient_location_city": subaward.get("recipient_location", {}).get("city_name"),
+        "recipient_location_state": subaward.get("recipient_location", {}).get("state_code"),
+        "recipient_location_zip": subaward.get("recipient_location", {}).get("zip5"),
+        "recipient_location_country": subaward.get("recipient_location", {}).get("country_name"),
+
+        # ── Resolved URL key pair ─────────────────────────────────────────────
+        "subawardee_url": url_map.get(recipient_name),           # resolved URL
+        "subawardee_url_map": {recipient_name: url_map.get(recipient_name)},  # key pair
+
+        # Award Details
+        "subaward_amount": subaward.get("subaward_amount"),
+        "action_date": subaward.get("action_date"),
+        "description": subaward.get("description"),
+        "award_type": subaward.get("award_type"),
+
+        # Parent Contract Context
+        "prime_recipient_name": parent_award.get("Recipient Name"),
+        "prime_award_amount": parent_award.get("Award Amount"),
+        "prime_award_start_date": parent_award.get("Start Date"),
+        "prime_award_end_date": parent_award.get("End Date"),
+
+        # Metadata
+        "scraped_at": datetime.utcnow().isoformat(),
+        "source": "USASpending.gov API v2"
+    }
+
+# step 5 
+
+def ensure_directory(path: str):
+    """Create output directory if it doesn't exist."""
+    os.makedirs(path, exist_ok=True)
+    print(f"  Output directory ready: {path}")
+
+
+def save_subawards_json(data: dict, piid: str) -> str:
+    """
+    Save subaward JSON to the output directory.
+    Files are organized as: OUTPUT_DIR/PIID/subawards_PIID_TIMESTAMP.json
+    """
+    safe_piid = piid.replace("/", "_").replace(" ", "_")
+    piid_dir = f"{OUTPUT_DIR}/{safe_piid}"
+    ensure_directory(piid_dir)
+
+    timestamp = datetime.utcnow().strftime('%Y%m%d_%H%M%S')
+    filename = f"subawards_{safe_piid}_{timestamp}.json"
+    filepath = f"{piid_dir}/{filename}"
+
+    with open(filepath, "w") as f:
+        json.dump(data, f, indent=2)
+
+    print(f"  Saved: {filepath}")
+    return filepath
+
+
+def save_url_map_json(url_map: dict, piid: str) -> str:
+    """
+    Save the company → URL key pair map as a separate reference file.
+    """
+    safe_piid = piid.replace("/", "_").replace(" ", "_")
+    piid_dir = f"{OUTPUT_DIR}/{safe_piid}"
+    ensure_directory(piid_dir)
+
+    timestamp = datetime.utcnow().strftime('%Y%m%d_%H%M%S')
+    filename = f"url_map_{safe_piid}_{timestamp}.json"
+    filepath = f"{piid_dir}/{filename}"
+
+    with open(filepath, "w") as f:
+        json.dump(url_map, f, indent=2)
+
+    print(f"  URL map saved: {filepath}")
+    return filepath
+
+# Step 6
+
+def fetch_subawards_for_contract(piid: str) -> dict:
+    """
+    Full pipeline:
+    1. Resolve PIID → internal award ID
+    2. Fetch all subawards
+    3. Resolve each subawardee company name → URL
+    4. Normalize all records with URL injected
+    5. Save JSON files to organized directory
+    """
+    print(f"\n{'='*60}")
+    print(f"Processing contract: {piid}")
+    print(f"{'='*60}")
+
+    # 1. Resolve PIID
+    internal_id, parent_award = get_award_id_from_piid(piid)
+
+    # 2. Fetch subawards
+    print(f"\n  Fetching subawards...")
+    raw_subawards = fetch_all_subawards(internal_id)
+
+    if not raw_subawards:
+        print(f"  No subawards found for {piid}")
+        return {"piid": piid, "total_subawards": 0, "subawards": []}
+
+    # 3. Resolve company URLs (deduplicated)
+    company_names = [s.get("recipient_name") for s in raw_subawards]
+    url_map = resolve_all_company_urls(company_names)
+
+    # 4. Normalize with URL injected
+    normalized = [normalize_subaward(s, piid, parent_award, url_map) for s in raw_subawards]
+
+    result = {
+        "piid": piid,
+        "internal_award_id": internal_id,
+        "parent_award": parent_award,
+        "total_subawards": len(normalized),
+        "subawardee_url_map": url_map,       # full company → url reference
+        "subawards": normalized,
+        "scraped_at": datetime.utcnow().isoformat()
+    }
+
+    # 5. Save files
+    print(f"\n  Saving files...")
+    save_subawards_json(result, piid)
+    save_url_map_json(url_map, piid)
+
+    print(f"\n  Done. {len(normalized)} subawards processed.")
+    return result
+
+
+# ── Run single contract ───────────────────────────────────────────────────────
+piid = "W912BU21C0003"
+data = fetch_subawards_for_contract(piid)
+
+
+# ── Run bulk contracts ────────────────────────────────────────────────────────
+def run_bulk(piid_list: list) -> list:
+    summary = []
+    for piid in piid_list:
+        try:
+            data = fetch_subawards_for_contract(piid)
+            summary.append({
+                "piid": piid,
+                "status": "success",
+                "total_subawards": data["total_subawards"]
+            })
+        except Exception as e:
+            print(f"  ERROR for {piid}: {e}")
+            summary.append({"piid": piid, "status": "failed", "error": str(e)})
+        time.sleep(2)
+    return summary
+
+piids = ["W912BU21C0003", "FA8732-20-C-0001"]
+summary = run_bulk(piids)
+print(json.dumps(summary, indent=2))
+
+Step 7 
+
+from pyspark.sql.functions import explode, col
+
+df_raw = spark.read.option("multiline", "true").json(f"{OUTPUT_DIR}/*/*.json")
+
+df_subawards = df_raw.select(
+    col("piid"),
+    explode("subawards").alias("sub")
+).select(
+    col("piid"),
+    col("sub.subaward_number"),
+    col("sub.subaward_id"),
+    col("sub.recipient_name"),
+    col("sub.recipient_uei"),
+    col("sub.recipient_location_city"),
+    col("sub.recipient_location_state"),
+    col("sub.subaward_amount"),
+    col("sub.action_date"),
+    col("sub.description"),
+    col("sub.subawardee_url"),              # resolved URL column
+    col("sub.subawardee_url_map"),          # key pair column
+    col("sub.prime_recipient_name"),
+    col("sub.prime_award_amount"),
+    col("sub.scraped_at")
+)
+
+df_subawards.display()
+
+df_subawards.write.format("delta").mode("append").saveAsTable(
+    "your_catalog.your_schema.contract_subawards"
+)
+```
+
+---
+
